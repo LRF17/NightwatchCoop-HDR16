@@ -128,6 +128,16 @@ overlay, which is thrown away on return (event_flags.md 3); the item stays. That
   `0x1789A40(*0x553D6D0, 0x2C, buf, 8)`; on the host `0x17DE6E0` + give unless role 6 (`0x17D88BB`). Spawning a
   shared item on a client goes the same way (`0x17D8370`, packet 0x2C subtype 3). [static; the host's reply
   path for 0x2C is not traced]
+* **Pickup animation** (live 2026-10-20, agent pickupanim): the action-button handler `0x12FD880` calls the pickup, then
+  `0x132E960(luaEv, 4010, 1|2)`: Lua event 4010 locally and, with `+0x8B` set, packet `0xE {0xC, 4010, arg, 0, playId}` to
+  every other member (playId = own PlayerGameData `+0x10`). `global_event.lua` `OnEvent_4010_1/2` ->
+  `Luafunc_PlaySynchroAnimation`: a net message plays `ANIMEID_PICK` (7520; TimeAct 101140) on entity
+  `NET_PLAYER (10001) + GetPlayID()`, which `0x13C97A0` resolves to the first player chr (WorldChrMan `+0x38`, the
+  local one included) whose `+0x3B8` equals the id. Remote chrs get `+0x3B8` from their GameData row `+0x10`
+  (`0x1E50090` -> `0x18DB500` -> `0x18D8100`). The title join and the A5 arrival wrote a fixed `+0x10 = 2`, so with
+  two or more guests they shared id 2 and one guest's pickup knelt the other guest's own character (and, on the
+  host, the first chr with id 2). Fixed: the own room member id (`SummonedPlayId`, party_b2.cpp; host 1, guests
+  2, 3, 4, what a vanilla join of a second guest left: 3). `BB_PARTY_ANIM_WATCH=1` logs ids and animations.
 * **Enemy drops** (`0x17DD0B0`): byte [2] gate only (`0x17DD1C3`; types 0/1/8 pass), then
   `isClient` is stored at `0x17DD193` and used once at `0x17DD75D`: a client keeps an item only if its
   equip param has `isGuestDrop` (goods byte 0x47 bit 3, weapon 0x104 bit 4, protector 0xDF bit 0; gems
@@ -483,6 +493,68 @@ items [8:102001x1 [gem 102001 (flags 2, rank 1, effects 1125000 -1 -1 -1 -1 -1)]
 -1 -1 -1) (inventory add, item-get dialog); own-save flag(s) 52700180 set (pool, load mode 1),
 overlay untouched`. Unit tests: `test_gems` (party-items-test).
 
+### 10.3 Item spots hidden by their own event flag (playtest 2026-10-20)
+
+Some host-only (`2003[4]`) map awards sit at an item spot whose visibility is **not** the lot's
+pickup flag but the awarding event's own completion flag: Old Yharnam's altar, event 12300130
+(`祭壇を調べる`: `3[24]` action button 2300000 on object 2301500, `2003[4]` lot 2300170 Ritual
+Blood (1) x2, `1003[2]` ends it once 12300130 is set). Its flag is an `item_lot_picked` flag
+(party_flags.inc "chest / item award"), so it is instanced (world_actions.md 4): the host's 12300130
+is skipped on a guest (`guest applied 0 flags ... skipped 1`), and the guest's own copy set by its
+event run stays "kept local". The guest got the lot from C3 (its own pool: 52300170), but nothing
+put 12300130 into its own pool; at the next load the overlay's item bits were rebuilt from the own
+pool (`GuestItemOverlaySync`), the altar was offered again, and the guest's press awarded the lot
+with hostOnly 1 on a client: refused (`0x17DDD3E`), no item box, nothing given (playtest guest log,
+mark 3: 19:58:37 shared, 20:00:19 the host's death respawn, 20:04:19 the empty press).
+
+Fix: `item_tool.py gen-inc` writes `ITEM_AWARD_SPOT(lot, spot flag, note)`: the flagged lots a
+map's EMEVD `2003[4]` gives whose event flag (event id + slot) is an `item_lot_picked` flag of
+party_flags.inc (27 rows: the altar, chests, NPC gift spots; not area 29, not restart-on-reload
+events, not per-player 6000-8999 lots; flagless ledger lots keep their ledger bit only, see the
+ledger seeding in 9). A guest that is given such a lot (summoned: `ApplySummoned`, the flags go
+into the own pool before the give; at home: `Apply`) also gets the spot flag, and a lot found
+"already given" gets a missing spot flag too (a save from before the fix is repaired at the next
+item list). The overlay follows the own pool, so the spot is gone for the guest at once and after
+every load; no item is given twice (the lot's flag still decides the give). `BB_PARTY_ITEM_SPOTS=0`
+turns it off. Unit test: `ItemAwardSpotFlags` (party-items-test).
+Live (2 loopback instances, both saves with 12300130 / 52300170 cleared, the host awards lot
+2300170 through `0x17DDC50` with 12300130 (`BB_PARTY_ITEMS_HOST_TEST(_FLAGS)`), party travel to
+Old Yharnam, the host's death respawn, the guest warped to the altar and Cross): before the fix the
+guest's own pool had 52300170 but not 12300130, the altar showed "Inspect" after the respawn and the
+press logged `award lot 2300170 (hostOnly 1, flag 52300170) in another's world, role guest` with
+nothing given (the playtest exactly); with it `gave ... own-save flag(s) 52300170,12300130 set`,
+12300130 stayed 1 through both loads, no prompt at the same spot and no award (three tries).
+
+Not a party bug (same playtest, mark 4): ~30 pickups of a Pebble (goods 1230: maxNum 20,
+maxRepositoryNum 99 at EquipParamGoods +0x48) that each opened a box. The give list `0x17D89F0`
+puts what fits in neither the inventory nor the storage on the ground as a kind-1 map item
+(`0x17DA960`, prompt 10010103 "Pick Up Item") and shows "Unable to acquire <item> due to inventory
+or storage max" (`0x13107B0`, menu texts 506000 / 506001); each try takes it, refuses it and drops
+it again. Live: a summoned guest with 20 held and the storage filled to 99 reproduced the box and
+the re-drop on every press; storage itself works for a summoned guest (room for 5 with 20 held).
+Vanilla behaviour of a player at the item's maximum.
+Side note: on a client the enemy drop and ground item inserts (`0x17D5320` / `0x17D4C40`) give
+every record the bare kind as its handle (0x2 / 0x1; the host numbers them, role 6 / session slot
+gates at `0x17D5642` / `0x17D4F54`), so the pickup's lookup `0x17D81A0` takes the newest record of
+that kind, not the nearest one (live: two drop records on a guest, both 0x2). **Known issue, open**
+(later): a guest at one corpse can loot another (newer) one; the items are right, the corpses swap.
+
+### 10.4 Storage limit offset and the summoned give past the maximum (2026-10-21)
+
+`FillGoodsLimits` read EquipParamGoods `maxRepositoryNum` at +0x49; the game's storage cap reads
++0x48 (`0x15813A0`: `*(short*)(row + 0x48)`; Pebble 20 / 99, Antidote 10 / 99, Blood Vial 20 / 600).
+The s16 at +0x49 is 0 for nearly every goods, so `ClassifyLotFit` called a lot "Full" whenever the
+inventory was at its maximum and set the lot's flag without the item, although the storage had
+room (an item loss). Now `GoodsLimitsFromRow` reads +0x48 (unit test `test_goods_limits`: five
+rows from the 1.09 gameparam, a Pebble at 20 held fits).
+That alone would have moved the loss: the summoned direct give `GiveItemDirect 0x131CB70` only
+adds to the inventory, and past `maxNum` the rest is dropped (its overflow goes through
+`0x17DA830` with a count of 0). Goods that would pass the maximum are now given through the
+award's own give list `0x17D89F0` (`GiveGoodsViaList`, ItemList entry `{0xB0000000 | id,
+0x40000000 | id, n, -1}`): inventory first, the rest into the storage, else on the ground with the
+game's box, and the game's own item-get dialog (log: `past the maximum: the game's give list,
+storage room A -> B`).
+
 ### 10.2 The item-get dialog (2026-10-11)
 
 How it works [static]: the give list `0x17D89F0` (and our `ShowItemGet`) pushes an entry with
@@ -548,3 +620,169 @@ Live (r18, 2 instances, guest summoned, fixed shot.py, 2 s after each give): hos
 the same dialog - `Clear Deep Sea 1` (the host's blood gem, recreated on the guest), then
 `Clear Deep Sea 1` + `Poison Knife 8` with `OK`. No game or port change was needed; the
 bisect notes above stay as the record of what was ruled out.
+
+### 10.3 Key items while summoned (2026-10-20)
+
+Why they used to wait for the own world (0.6.2 - 0.6.9): a summoned guest's key items (goodsType
+1) and unique goods (maxNum 1, no storage) read 0 in its live inventory whatever its save holds
+(verify_c6: the Oedon Tomb Key read 0 after every host-world load and 1 at home; the 0.6.1
+regression run: Amelia's 4001 read 0 summoned, 1 at home). So (a) a give there cannot tell an
+item the guest already has (the game then refuses the second copy with the blocking "Unable to
+acquire ... inventory or storage max" box, seen live in 0.6.1 for lot 50000001), and (b) the
+playtest guest's real save (0.6.0) did not keep a key item given while summoned (4114 "held 0 -> 1",
+gone an hour later): what the summoned inventory shows is not all the save keeps.
+
+Opt-in since 0.7.0 (`BB_PARTY_KEY_ITEMS_SUMMONED=1`; default off, see 10.6 for why): a key-item grant whose done flag (lot flag / ledger
+bit) is not in the guest's own save - so the save never got this lot - is given at once while
+summoned (direct give, its flags into the own pool, the item-get dialog, a save request) and is
+**also** owed (`party_owed_lots.txt`, per save slot) and noted as a summoned give
+(`party_summoned_gives.txt`). In the next own world `SummonedGivesTick` (3 s) and `KeyCatchupTick`
+(4 s) read the real held count and give it only if the summoned copy did not stay; never a second
+copy (`KeyGiveAllowedHeld`). A grant whose done flag is set but whose unique items read 0
+(`LedgerSkipSuspicious`) still waits for the own world (it is most likely held). `=0`: the old rule.
+
+What the summoned view is [live, r1-r3 2026-10-20/21, `BB_PARTY_GESTURE_TEST` logs the inventory's
+two sections]: the inventory (PlayerGameData `+0x328`) keeps key items in its first section (index
+below `+0x24` = 64, entries at `+0x58`) and everything else in the second (`+0x48`). At home the
+first section held the test save's 7 key items; summoned it held **0** (the second section was the
+same 35 entries). A summoned give lands in that emptied section (`section 1 1 used`), and going home
+the game puts the saved key section back without it: "goods given while summoned are missing in
+the own world; given again: goods 4118 x1 (held 0 -> 1)". So the summoned copy is for the session
+in the host's world, the home check is what keeps it.
+
+Live (r3, 2 instances, guest summoned in the host's Dream, host `BB_PARTY_ITEMS_HOST_TEST=50800000`,
+Spark Hunter Badge 4118, not in the test save): guest `lot 50800000 ...: key item / unique goods
+4118: given now while summoned; also owed to the own world`, `goods 4118 x1 (held 0 -> 1, item-get
+dialog)`, the item box "Spark Hunter Badge 1" on the guest's screen; Leave -> own world: `given
+again: goods 4118 x1 (held 0 -> 1)`, then `owed lot 50800000: goods 4118 held 1 already: not given
+again`. Both saves on disk afterwards (`save_decode.py`, `user\savedata_party`): 4118 x1, flag
+60009038 set; the guest's save written after the rejoin (summoned again) still has 4118 x1.
+
+### 10.5 Used-up items never come back (2026-10-21)
+
+Report (0.6.9 playtest 2): "the host can have key items brought back after using them (a gold
+blood gem)". The item is Amelia's **Gold Pendant** (goods 4001, ledger lot 50000001, done flag
+12401800): goodsType 0, maxNum 1, no storage, and usable from the menu (refId 3392, use anim 29:
+it becomes a blood gem). So it was `KeyGoods` / `LedgerSkipSuspicious`, and the 0.6.2 rule
+"ledger bit and boss flag in the save, held 0 -> it was lost" (`KeyCatchupTick`, every own-world
+load, any role) gave it back after every use. The same rule ran in `Apply` (#16, a rejoin's full
+list at home) and, on master, in the owed check after a summoned give and in `SummonedGivesTick`
+(held below the count right after a summoned give -> given again, for any goods).
+
+Mechanism [live, run A 2026-10-21, master = 0.6.9 code here, default test save, which holds the
+ledger seed sources but no pendant]: host, first own world: `key item catch-up: gave goods 4001 x1
+(lot 50000001, ledger 35 = flag 60009035 set with boss flag 12401800 in this save; held 0 -> 1)`.
+
+Rule now: a held count of 0 means "lost" only for KeyGoods that cannot be used up
+(`KeyRegiveAllowed`: EquipParamGoods refId < 0 and goodsUseAnim 0, read into
+`LotSlotState::usable` - keys, badges, workshop tools, chalices). For everything else the grant
+decides, never the held count:
+* `KeyCatchupNeeded` / `Apply` #16 / the summoned "checked in the own world" defer: only lots whose
+  every slot is `KeyRegiveAllowed` (Gold Pendant, Tear Stone 4301, Iosefka's vial: skipped as given).
+* summoned key give (10.3): only when every KeyGoods slot is `KeyRegiveAllowed`; a usable unique
+  item waits for the own world as in 0.6.2 - 0.6.9 (`SummonedKeyGiveNow`).
+* owed lots (`party_owed_lots.txt`, now `LOT SLOT GIVEN`; an old two-field line counts as given):
+  given while summoned -> only a `KeyRegiveAllowed` item reading 0; deferred -> once, only when the
+  lot's done flag is not in the save, and the give sets it (`OwedGiveAllowed`), so a rejoin's full
+  list never gives it again after it was used.
+* `SummonedGivesTick` re-gives (and `party_summoned_gives.txt` records) only `KeyRegiveAllowed`
+  goods: the second inventory section is the same summoned and at home, so anything else held below
+  the count after the give was used, dropped or sold.
+
+* `KeyGoodsWatchTick`: a `KeyRegiveAllowed` key item whose count rises while summoned (an NPC's
+  gift in the host's world: playtest 2 guest logs, Tonsil Stone 4310 `0 -> 1` from the talk, `x0`
+  after the next load) is noted like a party give, so the own world gives it back if the save lost it.
+
+Unit tests: `test_key_catchup` (party-items-test). Test aid: `host_use=GOODS:take@S`.
+
+Live (run B, fixed build, 2 instances, `BB_PARTY_ITEMS_HOST_TEST=50800000,50000001`, host chain
+`host_use=4001:take`, `host_warp` x2): host first own world `4001 x0`, no catch-up; the award test
+gives the pendant (`4001 0 -> 1`), used (`held 1 -> 0`), after both warps `4001 x0`, nothing given.
+Guest (summoned): `skip ... lot 50000001 ...: already given (own-save flag 60009035 set; 4:4001
+held 0)` instead of the old "checked in the own world" (which the catch-up then gave).
+
+The guest's "all key items gone after an area load" (issue 1) is the game's summoned view, not a
+loss [live, run B, `save_decode.py` on the guest's `savedata_party` written every 15 s]: summoned,
+`key goods held` reads 4000 / 4114 `x0` after every host-world load and `x1` again at home; every
+save written during the session (Dream, Tomb of Oedon, Cathedral Ward, home) lists all 7 key items
+of the test save. A key item given while summoned (4118) is in the save written before the next
+load, gone from the one after it (the game rebuilds the key section from the saved one), and given
+again at home (`goods given while summoned are missing in the own world; given again: goods 4118
+x1`). Note: a save written while summoned holds the saved key section plus the summoned additions,
+so a summoned give of a key item the save already holds would add a second stack; a player's save
+(not a party test save) showed `4001 x1` twice in its key list after 0.1 h of play (the copy 0.1 h
+older had one). Its build and logs are not ours, so the path that added it is not known; the
+summoned give is guarded by the lot's done flag, and usable unique goods are no longer given while
+summoned at all.
+
+### 10.6 Putting a summoned guest's key items back after each load (2026-10-21, off)
+
+Request: a summoned guest's key section is empty after every host-world load (10.3); give its key
+items back silently right after the load. `SummonedKeyRestoreTick` (party_items.cpp): 0.3 / 1 / 3 s
+after each load (load mode 1, client role) every known key item that is never used up
+(`SummonedRestoreAllowed` = `KeyRegiveAllowed` and held 0) is given with GiveItemDirect (no box, no
+sound); known = the own world's key section (`KeySectionItems`, recorded 5 s into each own world in
+`user\party_key_items.txt` per save slot) plus what reached the guest while summoned, or, for a
+character never seen at home, the ledger / shared-key lots whose done flag its save holds.
+
+Live (run D, 2 instances, guest summoned in the Dream, then `host_warp=2412953`): after the warp
+`summoned key items put back after the load (pass 1, 0.3 s after it, ...): 4000, 4114`, and the key
+item view on the guest's screen shows the Sword Hunter Badge while summoned. **But the save gets the
+keys twice**: `save_decode.py` on the guest's `savedata_party` written while summoned after the
+restore lists `4000 x1` and `4114 x1` twice (the 7 saved keys, then the restored ones), and so does
+the save written back home after the Leave (`+98 s`, "C3 goods given while summoned, kept at
+home"). A save written while summoned holds the hidden key section plus the summoned view (also seen
+in run B with 4118), so any give of a key the save already holds makes a second stack - most likely
+how a player's save got the Gold Pendant twice. The in-memory check (`ItemStacks`, "DUPLICATE
+STACK") did not see it: only the written save has the two stacks. So it is **off by default**
+(`BB_PARTY_KEY_RESTORE=1` for tests). Doing it right needs the place the game keeps the hidden key
+section while summoned (show or copy that, instead of a give) [not found yet].
+
+## 11. Gestures (2026-10-20)
+
+How the game keeps them [static, checked on the test save]: gestures are no inventory items and no
+flags of their own. `GestureGameData` (PlayerGameData `+0x5B8`, built in `0x14F1510`; its 0x78 bytes
+read / written with the character by `0x14EDD10` / `0x14EDD40`) holds 30 u32 entries at `+0x10`:
+`display index << 16 | param id << 1 | learned`. Param id p = gesture index + 1 indexes the static
+gesture table `0x55526D0` (filled by `0x14EC980`): {goods 800 + index (the EquipParamGoods row for
+the name / icon), message 301000 + index, index, motion}. The test save's entries (`userdata0000
++0x19120`) have bit 0 on for goods 800..803, 808, 809, 812, 813, 821; no goods 800..822 entry is in
+its inventory. A talk script teaches a gesture with ESD command `0x41` (the item-get notice of goods
+800 + i with a null handle, `0x16D8850`) and command `0x42` (index): bit 0 of that entry
+(`0x203FFD0` case 0x42; `0x14EDF10` does the same and has no caller), plus its "taught" flag, an
+argument of the teaching state: 6740 + i (804..820; League Oath 822 -> 6770), all in the personal
+block 6000-8999. Lots 2010150 (800) and 9906160 / 9906165 (801) are the only item lots with gesture
+goods; 800..803, 808, 812 and 821 are a new character's.
+
+What went wrong in a party: the taught flag stays in the guest's own pool when summoned, the
+learned bit did not reach the other members at all, and a guest's own bit learned in the host's
+world could be missing at home (the user's 0.6.9 report) while the flag said "taught", so the NPC
+never taught it again.
+
+`party_gestures.{h,cpp}`:
+* every member reads its learned bits every second in a steady world (own or summoned) and sends
+  them (EVENT `gestures` `{"goods":[...]}`) when they change and every 60 s: a guest to the host,
+  the host to everyone. The host learns a guest's new gesture at once, so its list is the party's.
+* a peer's gesture this save lacks is owed (`user\party_gestures.txt`, `owed SLOT GOODS SUMMONED`,
+  per save slot) and learned at once, summoned or at home: bit 0, the taught flag (own pool), the
+  item-get notice as the talk shows it, a save request.
+* a gesture learned while summoned (a party member's, or the guest's own NPC talk there) stays owed
+  with SUMMONED 1 until the own world reads its bit; missing there, it is learned again.
+* at home a taught flag without its bit (lost by an older build) is learned again.
+* peer lists: only goods 800..822, at most 64 (fuzzed: party-fuzz peerev).
+
+Live (r3, 2 instances, guest summoned in the host's Dream; `BB_PARTY_GESTURE_TEST`: the host learns
+League Oath 822 at home, the guest Make Contact 820 while summoned): guest `test (summoned): gesture
+820 (Make Contact) learned (item-get notice); taught flag 6760 set (own pool); load mode 1`; host
+1 s later `gesture 820 (Make Contact) from a party member: owed ...`, `a party member's gesture (own
+world): gesture 820 ... learned`; guest `a party member's gesture (summoned): gesture 822 (League
+Oath) learned ...; load mode 1`. Item boxes "Make Contact 1 / League Oath 1" on both screens. Leave
+-> the guest's own world: `learned 800 801 802 803 808 809 812 813 820 821 822`, `gesture 822 ...:
+in this save (own world, learned), the one learned while summoned kept; no longer owed`; rejoined:
+the same list summoned. On disk (both saves, GestureGameData found by its entry pattern): bits of
+800..803, 808, 809, 812, 813, 820, 821, 822; flags 6760 and 6770 set. r2 found a stale owed entry
+(SUMMONED 1, bit 0 after a fresh save) waiting forever while summoned: a missing bit is now learned
+in any world. r4 (same fixtures, screenshots of the menus while summoned): the gesture menu's list
+(touchpad, Triangle) ends with "Make Contact" and "League Oath" on the guest and on the host; the
+guest's Inventory > Key Items tab shows "Spark Hunter Badge", held 1 / 1, while it is summoned.
+Unit tests: `party-gestures-test` (ids and taught flags, JSON, entries, the owed store, the decision).

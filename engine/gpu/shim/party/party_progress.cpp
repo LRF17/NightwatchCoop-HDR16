@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -1301,6 +1302,7 @@ struct MirrorTables {
     std::vector<int> keys;
     std::vector<GroupBytes> masks;  // per pool key; all zero outside the mirror
     std::vector<GroupBytes> items;  // per pool key: the masked item_lot_picked bits
+    std::vector<GroupBytes> shop;   // per pool key: the shop stock bits (never in `masks`)
 };
 std::atomic<bool> g_instanced_items{false};
 const MirrorTables& Mirror() {
@@ -1308,6 +1310,10 @@ const MirrorTables& Mirror() {
         MirrorTables m;
         m.masks.assign(kPoolBlocks, GroupBytes{});
         m.items.assign(kPoolBlocks, GroupBytes{});
+        m.shop.assign(kPoolBlocks, GroupBytes{});
+        // BB_PARTY_SHOP_STOCK=0: the 0.6.9 behaviour (the host's stock mirrored; a live repro aid).
+        const char* ss = std::getenv("BB_PARTY_SHOP_STOCK");
+        const bool shop_per_player = !(ss && ss[0] == '0');
         for (int key = 0; key < int(kPoolBlocks); ++key) {
             const u32 block = BlockOfPoolKey(key);
             if (block == 0xffffffffu) {
@@ -1333,9 +1339,15 @@ const MirrorTables& Mirror() {
             for (u32 bit = 0; bit < kBitsPerBlock; ++bit) {
                 const u32 id = first + bit;
                 // Lamp / headstone "used" triggers are per player: mirrored, the host's headstone ran the
-                // guest's warp event too (playtest 1 bug 20).
-                if ((id >= 2000 && id <= 2099) || (id >= 9020 && id <= 9026) || deathrules::LampTriggerFlag(id)) {
+                // guest's warp event too (playtest 1 bug 20); so are the talk state flags of that shape.
+                if ((id >= 2000 && id <= 2099) || (id >= 9020 && id <= 9026) || deathrules::LampTriggerFlag(id) ||
+                    deathrules::TalkStateFlag(id)) {
                     PutBit(mask.data(), bit, false);
+                }
+                // Shop stock is per player: mirrored, the host's purchase sold the item out on the guest.
+                if (shop_per_player && ShopStockFlag(id)) {
+                    PutBit(mask.data(), bit, false);
+                    PutBit(m.shop[key].data(), bit, true);
                 }
             }
             for (u32 bit = kBitsPerBlock; bit < kBlockBytes * 8; ++bit) {
@@ -1357,6 +1369,47 @@ bool NonZero(const GroupBytes& g) {
     return std::any_of(g.begin(), g.end(), [](u8 b) { return b != 0; });
 }
 } // namespace
+
+bool ShopStockFlag(u32 id) {
+    // The "shop stock row" rows of party_flags.inc (flag_tool.py gen-inc: every ShopLineupParam
+    // eventFlag), as sorted ranges.
+    static const std::vector<std::pair<u32, u32>> ranges = [] {
+        std::vector<std::pair<u32, u32>> r;
+        for (const Row& row : kRows) {
+            if (row.note && std::strncmp(row.note, "shop stock row", 14) == 0) {
+                r.emplace_back(row.first, row.last);
+            }
+        }
+        std::sort(r.begin(), r.end());
+        return r;
+    }();
+    auto it = std::upper_bound(ranges.begin(), ranges.end(), std::make_pair(id, 0xffffffffu));
+    return it != ranges.begin() && id <= std::prev(it)->second;
+}
+
+const GroupBytes& WorldShopMask(int key) {
+    return key >= 0 && key < int(kPoolBlocks) ? Mirror().shop[key] : kZeroGroup;
+}
+
+ShopMerge MergeShopStock(u32 block, const GroupBytes& mask, GroupBytes* overlay, GroupBytes* pool) {
+    ShopMerge r;
+    for (u32 i = 0; i < kBlockBytes; ++i) {
+        const u8 to_pool = u8((*overlay)[i] & ~(*pool)[i] & mask[i]);
+        const u8 to_overlay = u8((*pool)[i] & ~(*overlay)[i] & mask[i]);
+        for (u32 b = 0; (to_pool | to_overlay) && b < 8; ++b) {
+            const u8 m = u8(0x80u >> b);
+            if (to_pool & m) {
+                r.saved.push_back(block * kBitsPerBlock + i * 8 + b);
+            }
+            if (to_overlay & m) {
+                r.shown.push_back(block * kBitsPerBlock + i * 8 + b);
+            }
+        }
+        (*pool)[i] = u8((*pool)[i] | to_pool);
+        (*overlay)[i] = u8((*overlay)[i] | to_overlay);
+    }
+    return r;
+}
 
 bool WorldMirrorKey(int key) {
     const auto& k = Mirror().keys;
@@ -1846,8 +1899,57 @@ void NoteLocalSet(u32 id) {
     }
 }
 
+// Test aid (BB_PARTY_WORLD_WATCH=id,...): every write of a watched flag through SetEventFlag /
+// CompleteEvent, with the game return addresses found on the stack (who wrote it); 600 lines at most.
+const std::vector<u32>& WatchedWrites() {
+    static const std::vector<u32> ids = [] {
+        std::vector<u32> v;
+        const char* e = std::getenv("BB_PARTY_WORLD_WATCH");
+        while (e && *e) {
+            char* end = nullptr;
+            const unsigned long x = std::strtoul(e, &end, 10);
+            if (end == e) {
+                break;
+            }
+            v.push_back(u32(x));
+            e = *end ? end + 1 : end;
+        }
+        return v;
+    }();
+    return ids;
+}
+__attribute__((noinline)) void TraceWatchedWrite(const char* via, u64 man, u32 id, u32 on) {
+    static std::atomic<int> lines{0};
+    if (lines.load(std::memory_order_relaxed) >= 600) {
+        return;
+    }
+    const std::vector<u32>& w = WatchedWrites();
+    if (std::find(w.begin(), w.end(), id) == w.end()) {
+        return;
+    }
+    lines.fetch_add(1, std::memory_order_relaxed);
+    const u64 base = Guest(0), size = ImageSize();
+    char callers[160] = {};
+    int n = 0, len = 0;
+    const u64* sp = static_cast<const u64*>(__builtin_frame_address(0));
+    for (int i = 0; i < 160 && n < 5; ++i) {
+        u64 v = 0;
+        if (!SafeGet(reinterpret_cast<u64>(sp + i), &v) || v <= base || v >= base + size) {
+            continue;
+        }
+        len += std::snprintf(callers + len, sizeof callers - std::size_t(len), " 0x%llx", static_cast<unsigned long long>(v - base));
+        ++n;
+    }
+    std::printf("Party progress: watched flag write %u = %u via %s (%s manager); stack:%s\n", id, on, via,
+                man == 0 ? "no" : "a", callers);
+    std::fflush(stdout);
+}
+
 BB_COOP_SYSV void OnSetEventFlag(u64 man, u64 id, u64 on, u64, u64, u64) {
     perf::Scope z(perf::Zone::HookSetFlag);
+    if (!WatchedWrites().empty()) {
+        TraceWatchedWrite(man == Manager() ? "SetEventFlag" : "SetEventFlag (other manager)", man, u32(id), u32(on));
+    }
     if (Capturing() && man == Manager()) {
         NoteId(u32(id));
     }
@@ -1868,6 +1970,9 @@ BB_COOP_SYSV void OnSetEventFlagValue(u64 man, u64 first, u64 bits, u64, u64, u6
 
 BB_COOP_SYSV void OnBroadcastSetFlag(u64, u64 id, u64, u64, u64, u64) {
     perf::Scope z(perf::Zone::HookBroadcastFlag);
+    if (!WatchedWrites().empty()) {
+        TraceWatchedWrite("CompleteEvent", 1, u32(id), 1);
+    }
     if (std::int32_t(u32(id)) >= 0) {
         NoteLocalSet(u32(id));
     }
@@ -2149,6 +2254,53 @@ std::size_t GuestItemOverlaySync(const FlagStore& store, const std::map<u32, u64
         }
     }
     return bits;
+}
+
+/// Guest, main thread, load mode 1: shop stock is per player (ShopStockFlag). The shop reads and
+/// writes the host-world overlay (global T7 zone 9, m21_00 T7 zone 1), which the mirror leaves
+/// alone for these bits: each frame the overlay's stock bits and the own pool's are merged set-only
+/// both ways, so the guest's shop shows the guest's own purchases and a purchase made here is saved.
+void GuestShopStockTick(const FlagStore& store) {
+    static const std::vector<int> keys = [] {
+        std::vector<int> k;
+        for (int key : WorldMirrorKeys()) {
+            const GroupBytes& m = WorldShopMask(key);
+            if (std::any_of(m.begin(), m.end(), [](u8 b) { return b != 0; })) {
+                k.push_back(key);
+            }
+        }
+        return k;
+    }();
+    bool saved = false;
+    for (int key : keys) {
+        const u32 block = BlockOfPoolKey(key);
+        BlockRef r;
+        const u64 pool = store.PoolBlockAddress(key);
+        if (!pool || !store.FindBlock(block, &r) || r.kind != 2 || !r.data || r.data == pool) {
+            continue;  // not this map's overlay group (another map's T7 zone 1: not in the tree)
+        }
+        GroupBytes cur, own;
+        if (!store.ops().read(r.data, cur.data(), kBlockBytes) || !store.ops().read(pool, own.data(), kBlockBytes)) {
+            continue;
+        }
+        const ShopMerge m = MergeShopStock(block, WorldShopMask(key), &cur, &own);
+        if (!m.saved.empty() && store.ops().write(pool, own.data(), kBlockBytes)) {
+            saved = true;
+            for (u32 id : m.saved) {
+                Log("guest shop stock: purchase %u in the host's world saved to the own save (per player)", id);
+            }
+        }
+        if (!m.shown.empty() && store.ops().write(r.data, cur.data(), kBlockBytes)) {
+            std::string list;
+            for (u32 id : m.shown) {
+                list += (list.empty() ? "" : " ") + std::to_string(id);
+            }
+            Log("guest shop stock: %zu own purchase(s) shown in the host's world: %s", m.shown.size(), list.c_str());
+        }
+    }
+    if (saved) {
+        RequestGameSave("shop purchase in the host's world");
+    }
 }
 
 const char* MirrorWhy(bool full, u64 id, u64 last) {
@@ -2445,6 +2597,9 @@ void Tick(const GameSnapshot& s) {
     if (role == Role::Host && store.LoadMode() == 0) {
         HostTick(g, store, s, now);
     } else if (role == Role::Guest) {
+        if (store.LoadMode() == 1) {
+            GuestShopStockTick(store);
+        }
         GuestTick(g, store, s.map_id);
     }
     if (g.dump) {
