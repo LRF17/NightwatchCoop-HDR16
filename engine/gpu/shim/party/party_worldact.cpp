@@ -35,9 +35,21 @@ std::int32_t RepeatGiftLot(std::uint32_t trigger) {
     }
 }
 
+std::int32_t OwnTalkGiftLot(std::uint32_t trigger) {
+    // m27 event 12700906 (`DLC_NPCアイテム入手XX`, slots 0 / 1): trigger flag + the lot's personal flag.
+    switch (trigger) {
+    case 72700321u: return 43120;  // Valtr: the Impurity rune (GemGen 200030, flag 6676)
+    case 72700322u: return 43130;  // Valtr: the League Staff (goods 131, flag 6678)
+    default: return -1;
+    }
+}
+
 bool WorldActionAllowed(std::uint32_t id, bool clear, std::uint32_t host_map) {
     if (RepeatGiftLot(id) > 0) {
         return false;  // P2: the guest's own gift (its own grant), never the host's 9100
+    }
+    if (OwnTalkGiftLot(id) > 0) {
+        return false;  // 0.7.3: the guest's own gift; the host's 12700906 would give it to the host
     }
     const int key = progress::PoolKeyOfId(id);
     if (key < 0 || !progress::WorldMirrorKey(key) || progress::NeverWritable(id) ||
@@ -47,7 +59,9 @@ bool WorldActionAllowed(std::uint32_t id, bool clear, std::uint32_t host_map) {
     if (NpcGiftTrigger(id)) {
         return !clear;  // set only: the host's own 9040 awards the gift once (P1)
     }
-    const Category c = progress::CategoryOf(id);
+    // 0.7.3: covenant outcomes are per player while the host's rule is on (the host's world keeps
+    // its own; the guest's change stays in its overlay). Off: the base category, as before.
+    const Category c = progress::EffectiveCategory(id, progress::CovenantPerPlayer());
     // Elevator / two-state object flags (C2's state ids, e.g. 12410350/351 Central Yharnam's lift):
     // the lift's own network-synced events and the replicated ObjAct kick move it on the host; a
     // guest's value, arriving later, would fight the host's ride. A lift ride the host's game did
@@ -560,6 +574,7 @@ FogAction HostFogAction(const BossGate& g, bool guest_starts_on, bool intro_done
 
 #include "coop_hooks.h"
 #include "party_b2.h"
+#include "party_balance.h"
 #include "party_death_rules.h"
 #include "game_state.h"
 #include "party_director.h"
@@ -678,6 +693,7 @@ std::atomic<double> g_pickup_at{-1e9};     // Now() of the last one
 std::mutex g_gift_mu;
 std::vector<std::uint32_t> g_gift_sets;
 std::vector<std::uint32_t> g_repeat_sets;  // P2: repeatable gift triggers (RepeatGiftLot) this game set
+std::vector<std::uint32_t> g_own_sets;     // 0.7.3: own talk gift triggers (OwnTalkGiftLot) this game set
 std::mutex g_kick_mu;
 std::vector<std::int32_t> g_kicks_out;
 std::atomic<std::uint32_t> g_keygate_own{0};  // guest: a key-item gate it opened (own save, GuestTick)
@@ -702,6 +718,13 @@ void OnLocalGiftSet(std::uint32_t id) {
         }
         return;
     }
+    if (OwnTalkGiftLot(id) > 0) {
+        std::lock_guard<std::mutex> lk(g_gift_mu);
+        if (g_own_sets.size() < 16 && std::find(g_own_sets.begin(), g_own_sets.end(), id) == g_own_sets.end()) {
+            g_own_sets.push_back(id);
+        }
+        return;
+    }
     if (!NpcGiftTrigger(id)) {
         return;
     }
@@ -720,6 +743,12 @@ std::vector<std::uint32_t> TakeRepeatSets() {
     std::lock_guard<std::mutex> lk(g_gift_mu);
     std::vector<std::uint32_t> out;
     out.swap(g_repeat_sets);
+    return out;
+}
+std::vector<std::uint32_t> TakeOwnSets() {
+    std::lock_guard<std::mutex> lk(g_gift_mu);
+    std::vector<std::uint32_t> out;
+    out.swap(g_own_sets);
     return out;
 }
 std::mutex g_treasure_mu;
@@ -900,6 +929,7 @@ void GuestTick(const GameSnapshot& s, party::PartyLink* link) {
         }
         if (s.session_role != 6) {
             TakeRepeatSets();  // its own world: its own 9100 awards them
+            TakeOwnSets();     // its own world: its own 12700906 awards them
         }
         return;
     }
@@ -979,6 +1009,23 @@ void GuestTick(const GameSnapshot& s, party::PartyLink* link) {
         Log("guest: repeatable NPC gift trigger %u set by its talk in the host's world: lot %d %s; trigger %s "
             "(common 9100 does that on the host only)", id, lot,
             queued ? "given to this guest (own grant)" : "NOT queued (items off)", cleared ? "cleared" : "NOT cleared");
+    }
+    for (std::uint32_t id : TakeOwnSets()) {
+        // 0.7.3: Valtr's rune / staff. Joining the League is this player's own (covenant outcomes are
+        // per player), and so is the item: its own grant with the lot's personal flag (6676 / 6678 stay
+        // in the own pool while summoned), never the host's. The trigger stays in the overlay.
+        const std::int32_t lot = OwnTalkGiftLot(id);
+        const std::int32_t flag = ItemLotFlag(lot);
+        bool have = false;
+        if (flag > 0 && progress::ReadFlagOwnSave(static_cast<std::uint32_t>(flag), &have) && have) {
+            Log("guest: own talk gift trigger %u set by its talk in the host's world: lot %d already given (own flag "
+                "%d set); nothing given", id, lot, flag);
+            continue;
+        }
+        const bool queued = OfferOwnGift(lot);
+        Log("guest: own talk gift trigger %u set by its talk in the host's world: lot %d (flag %d) %s (m27 event "
+            "12700906 awards it in the own world only)", id, lot, flag,
+            queued ? "given to this guest (own grant)" : "NOT queued (items off or already queued)");
     }
     if (const std::uint32_t kgf = g_keygate_own.exchange(0)) {
         const bool ok = progress::WriteFlagOwnSave(kgf, true);
@@ -2835,7 +2882,42 @@ bool LiftBusyHere(const Lift& l, float radius) {
     return false;
 }
 
+// chalicelamp: the Chalice Dungeon lift cars this game has seen ride (liftrules::ChaliceLiftCar, from
+// the EMEVD dispatch thread); cleared at every load (another layout).
+std::mutex g_chalice_cars_mu;
+std::vector<std::int32_t> g_chalice_cars;
+void NoteChaliceCar(std::int32_t car) {
+    std::lock_guard<std::mutex> lk(g_chalice_cars_mu);
+    if (std::find(g_chalice_cars.begin(), g_chalice_cars.end(), car) != g_chalice_cars.end() ||
+        g_chalice_cars.size() >= 32) {
+        return;
+    }
+    g_chalice_cars.push_back(car);
+    Log("lift: Chalice Dungeon lift car %d seen riding (the on-a-moving-car test and the rider guard know it now)", car);
+}
+std::vector<std::int32_t> ChaliceCars() {
+    std::lock_guard<std::mutex> lk(g_chalice_cars_mu);
+    return g_chalice_cars;
+}
+// A learned dungeon car playing a ride within kLiftCarRadius (horizontally) of `p`: its height in *car_y.
+bool ChaliceCarNear(std::int32_t car, const float p[3], float band, float* car_y) {
+    ObjAnimState st;
+    float at[3];
+    if (!ReadObjAnim(car, &st) || !st.playing || !ObjectPoint(car, 0, 0, at) ||
+        std::hypot(p[0] - at[0], p[2] - at[2]) >= kLiftCarRadius || (band > 0 && std::fabs(p[1] - at[1]) > band)) {
+        return false;
+    }
+    *car_y = at[1];
+    return true;
+}
+
 bool OnMovingLiftCar(const float p[3]) {
+    for (const std::int32_t c : ChaliceCars()) {
+        float y = 0;
+        if (ChaliceCarNear(c, p, liftrules::kChaliceCarBand, &y)) {
+            return true;
+        }
+    }
     for (const Lift& l : Lifts()) {
         ObjAnimState car;
         float at[3];
@@ -2855,13 +2937,37 @@ bool OnMovingLiftCar(const float p[3]) {
 // ride, the local chr's ride bit and position; a drop through the car puts it back on the car.
 void LiftRiderTick(const GameSnapshot& s) {
     static liftrules::RiderTrack track;
+    static std::map<std::int32_t, liftrules::CarRider> car_riders;  // chalicelamp: per learned dungeon car
     static int logged = 0;
     if (!s.world_up || s.loading || !s.player) {
         track = liftrules::RiderTrack{};
+        car_riders.clear();
+        if (s.loading) {
+            std::lock_guard<std::mutex> lk(g_chalice_cars_mu);
+            g_chalice_cars.clear();
+        }
         return;
     }
     float me[4], rot[4];
     if (!LocalChrPose(me, rot)) {
+        return;
+    }
+    for (const std::int32_t c : ChaliceCars()) {
+        float car_y = 0, put[3];
+        const bool near = ChaliceCarNear(c, me, 0.0f, &car_y);
+        liftrules::CarRider& r = car_riders[c];
+        if (liftrules::CarRiderTick(r, near, car_y, me[0], me[1], me[2], put) != liftrules::RiderStep::through) {
+            continue;
+        }
+        alignas(16) float to[4] = {put[0], put[1], put[2], 1.0f};
+        alignas(16) float r16[4] = {rot[0], rot[1], rot[2], rot[3]};
+        const bool ok = b2::LocalChrWarp(s.player, to, r16, "a drop through a Chalice Dungeon lift's car: back on the car");
+        if (logged++ < 32) {
+            Log("lift ride: the local chr dropped through Chalice Dungeon car %d at (%.1f, %.1f, %.1f) (%.1f m under its "
+                "floor); %s (%.1f, %.1f, %.1f)", c, double(me[0]), double(me[1]), double(me[2]),
+                double(put[1] - 0.3f - me[1]), ok ? "put back on the car at" : "NOT put back to", double(put[0]),
+                double(put[1]), double(put[2]));
+        }
         return;
     }
     bool playing = false;
@@ -2994,6 +3100,12 @@ bool StandAtChr(std::int32_t entity, float dist, float angle_deg, std::string* w
     if (!c || !SafeRead(c + 0xc0, p, sizeof p) || !SafeRead(c + 0xd0, r, sizeof r)) {
         return false;
     }
+    // Where it stands now (its physics position): +0xc0 can lag far behind a chr that walked
+    // (D11 nf run 2: Henryk 14 m from his +0xc0 spot, the guest's R1s hit the air).
+    float now[3] = {};
+    if (balance::ChrPosition(c, now)) {
+        p[0] = now[0], p[1] = now[1], p[2] = now[2];
+    }
     // The chr's front: forward(yaw) = (-sin, -cos), yaw = +0xd0 [1].
     return PutLocal(p, -std::sin(r[1]), -std::cos(r[1]), dist, angle_deg, what);
 }
@@ -3108,7 +3220,23 @@ void BusyDeferRewriter(int event_id, int bank, int id, std::uint64_t event, std:
         }
     }
 }
+// chalicelamp: a Chalice Dungeon lift's ride animates its car (2003[18]): the car is learned.
+void ChaliceLiftWatcher(int event_id, int bank, int id, std::uint64_t event, std::uint64_t instr) {
+    if (bank != 2003 || id != 18 || !liftrules::ChaliceLiftEvent(event_id)) {
+        return;
+    }
+    std::uint32_t size = 0;
+    const std::uint64_t args = EmevdInstructionArgs(event, instr, &size);
+    std::int32_t entity = 0;
+    if (!args || size < 4 || !SafeGet(args, &entity)) {
+        return;
+    }
+    if (const std::int32_t car = liftrules::ChaliceLiftCar(event_id, bank, id, entity)) {
+        NoteChaliceCar(car);
+    }
+}
 void WorldactRewriter(int event_id, int bank, int id, std::uint64_t event, std::uint64_t instr) {
+    ChaliceLiftWatcher(event_id, bank, id, event, instr);
     KeyGateRewriter(event_id, bank, id, event, instr);
     LiftEndRewriter(event_id, bank, id, event, instr);
     BusyDeferRewriter(event_id, bank, id, event, instr);

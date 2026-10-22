@@ -32,8 +32,9 @@ The ten things most likely to go wrong in the next ~5 hours, and what to do in g
 
 1. **Snatchers (kidnappers) appear as soon as the Blood-starved Beast dies** (m24_00 12400791 /
    m27 1270501: on while flag 9453 "Blood-starved Beast killed" is set and the Blood Moon 9802 is
-   not), in Cathedral Ward and the Forbidden Woods. Only the **host** can be kidnapped
-   (12400780 / 12700500 need chr type 0); a guest killed by a Snatcher just dies (party death).
+   not), in Cathedral Ward and the Forbidden Woods. In the game data only the **host** can be
+   kidnapped (12400780 / 12700500 need chr type 0); since 0.7.3 (kidnapall, host rule
+   `party_any_kidnap` "Anyone can be abducted", on) a guest's grab takes the party too (below).
    The host's grab-death sets 9420, common 9421 moves the host's respawn point to the Hypogean Gaol
    (ReturnPoint 2802959, Yahar'gul) and the host's death becomes the party's respawn load; the
    guests replay it as a lamp warp to the host's last lamp record, which is then the Gaol
@@ -59,6 +60,26 @@ The ten things most likely to go wrong in the next ~5 hours, and what to do in g
    *Fixed (parg, live):* the host's +1 Insight at the end of 9422 (SpEffect 4680, host only) now
    reaches every guest present (`DirectInsight`, party_phantom.h): live, host 6 -> 7 at the end of
    the waking scene, `event 9422 gave the host 1 Insight`, guest `+1 here`, 14 -> 15.
+   *Added (kidnapall, 0.7.3): anyone can be abducted.* The grab event, decoded
+   (`m24_00 12400780`, 4 slots for Snatchers 2400872..875; `m27 12700500` for 2700680): `4[3]` chr
+   10000 type 0 or end; `4[0]` the Snatcher alive, `4[1]` chr 10000 damaged by it, `4[2]` its HP
+   ratio 0, `3[0]` 9401 and 9404 on; then `2003[2] 9420`. So the grab is a death by the Snatcher's
+   hit that the event recognises; on a guest (type 1) the copy ends at the gate and the death is an
+   ordinary phantom death. With the host's rule on, a summoned guest's copy runs past the gate (its
+   own chr type is written into the 4[3] argument, party_b2 `KidnapInstr`, rules in
+   `party_kidnap_rules.h`), its own 9420 write is skipped (never into the guest's flags or save, F1)
+   and the host is told (`b2` op `kidnap`). The host (9423 off, in m24/m27, alive, not in a boss
+   fight) sets its own 9420; its common 9421 moves the host's respawn point to the Gaol 2802959 and
+   clears 9420, as for its own grab; then the host makes the party's travel there (a decided lamp
+   warp to 2802959, no rest): one loading screen for everyone. The grabbed guest's follow waits for
+   its own death as at a wipe (`PlanWipeFollow`: its bloodstain where it fell, then a dead follow to
+   the cell). 9422 then plays the waking scene on the host's arrival. Off: as before (the gate is the
+   data's, the guest's death a plain death). Smoke `kd` (group `kidnap`): the guest grab first
+   (test aid `guest_die:kidnap`, what the copy does at the grab), then the host's grab as before.
+   *Changed (kidnapall, user decision 2026-10-22): the waking scene for everyone.* 0.7.1's "guests
+   skip 28000010" is gone: every guest plays the scene as its summoned replay once it stands in the
+   cell (its loading screen waits through the host's copy; a live mirror is still dropped outside
+   m28); 9423 with it, the +1 Insight by the host's relay as before.
 2. **Blood-starved Beast reward (Pthumeru Chalice)**: lot 80000000, flag 5000 (global) -> shared
    with every member through C3; the guest's item box waits for the boss banner to end. No intro
    cutscene, so the guest may go through the fog first (B2). *If the chalice is missing on the
@@ -226,6 +247,7 @@ major / minor / ok; **fix** = done here (F#), proposal (P#, list at the end) or 
 | Oedon Tomb doors | ObjAct 2410001 / 2410080 need goods 4000 | opens | can open with its own key; door state mirrored | ok | |
 | Cainhurst Summons letter | 12410510 (clinic), lot 2410990 flag 52410990, `2003[4]` | award | captured award -> shared | ok | |
 | Blood Gem Workshop Tool | lot 2411000 (treasure) | picks up | was per player | minor | F2 |
+| Iosefka's Blood Vial (real Iosefka, clinic door) | t241313 -> 72410310 (common 9100 slot 1, lot 23000, ledger 5), gated by 72410301 (npc_quest, shared; cleared by 12410736 at an own-world clinic load) | talk: own vial, C3 to the guests | talk: own vial + gift_up, the host's world awards it, C3 to every member | ok (0.7.3) | items.md 10.8 |
 | Fake Iosefka gifts | t241314 -> 9047-9053 (common 9040 slots 7-13, ledger lots) | | same as Djura | ok (P1 fixed, live with Eileen) | P1 |
 | Gilbert (window) | t241319 -> 9066 Flamesprayer (lot 29000, ledger 23) | | same as Djura | ok (P1 fixed, live with Eileen) | P1 |
 | Gascoigne's daughter | t241320 -> 9067 Tiny Music Box (lot 30000, ledger 24); Red Messenger Ribbon / brooch (12410713, lots 2410910/2410920) | | window talk works (D8) | ok (P1 fixed, live with Eileen) | P1 |
@@ -244,7 +266,7 @@ major / minor / ok; **fix** = done here (F#), proposal (P#, list at the end) or 
 | Vicar Amelia | defeat 12401800 (sets 2400-2402 never_sync), host entry 12401802 remo 24000060 (chr type 0), 9455 | intro + fight | either goes in first: a guest's fog starts the host's intro event (P5, live 2026-10-15); intro on every screen (live mirror) | ok | checklist 4; P5 |
 | Amelia reward | lot 50000001 goods 4001 (ledger 35); ObjAct 2400080 needs goods 4001 | gets it | ledger replay | ok | |
 | Amelia's skull -> night | 12401803 (host only), remo 24000030 tod 2 | plays, world -> night | live mirror; time-of-day catch-up into the own save (upward) | minor | checklist 5 |
-| Snatchers | spawn 12400791 / 12400797 (9453 and not 9802); kidnap 12400780 (chr type 0) sets 9420 | kidnapped -> Gaol | dies normally; follows the host's respawn (live, P7) | ok | F1, checklist 1 |
+| Snatchers | spawn 12400791 / 12400797 (9453 and not 9802); kidnap 12400780 (chr type 0) sets 9420 | kidnapped -> Gaol | grabbed: the party to the Gaol through the host (0.7.3 `party_any_kidnap`; off: dies normally); follows the host's respawn (live, P7) | ok | F1, checklist 1 |
 | Insight checks | 12404000 (host only): Insight >= 15 -> 12404002, >= 40 -> 12404001, >= 50 -> 12404003 (Cathedral Ward variants, DLC Amygdala) | | zone 4 flags: the host's values via the vanilla join snapshot | minor | |
 | Oedon Chapel NPCs | Dweller 113010 (t240312 -> gift 9045 Pebble), lonely old woman 6090 (t240316 -> 9054-9057 sedatives), old man 6080 (t240317/t240338 -> 9059-9064 pellets), Arianna 6110-6113 (Blood of Arianna: common 9100, repeatable, denied), Adella (9100, denied), Alfred 6151/6155 (t240333/t240343 -> 9072/9073), Eileen 6161 (t240325/t240341/t240342 -> 9074/9075 Crow Hunter Badge) | talk, gifts | solid since playtest 1; gifts as Djura; Blood of Arianna / Adella: the guest who talks gets its own (P2, 2026-10-15) | ok | P1, P2 |
 | Beast beggar (suspicious beggar) | NpcParam 504020 (only this talk NPC uses the row, every MSB checked), t240217 | talk | solid for the guest since P3 (2026-10-15): can talk; turned hostile he is a normal enemy on its screen | ok | P3 |
@@ -271,7 +293,7 @@ major / minor / ok; **fix** = done here (F#), proposal (P#, list at the end) or 
 | Lifts / gate | lift 12700130-132 (12700134/135), lift 12700140-142 (12700144/145), gate 12700170-172 + 12705490 (12700173/174) | | mirrored, State | minor | |
 | Snatchers | 1270501 (spawn), 12700500 (kidnap, chr type 0) | | | major | F1 |
 | Shadows of Yharnam | defeat 12701800 (2700/2701 never_sync, 9463), host entry 12701802 (no remo); lots 2700990 (flag 52700950), 2700995 | fight | first fight: host region or a guest's fog (P5); re-fights: B2; captured award (map flag) -> shared | ok | P5 |
-| Valtr / League (t270503, 6500), beggar 504030 (t270217, ghost), old man 6100 (t270317 -> 9058 Pungent Blood Cocktail) | | | gifts as Djura; beggar solid since P3 | ok | P1, P3 |
+| Valtr / League (t270503, 6500), beggar 504030 (t270217, ghost), old man 6100 (t270317 -> 9058 Pungent Blood Cocktail) | Valtr: state 1790-1809, m27 12700901-12700910, T7 72700300-72700339 (covenant_outcome, 0.7.3); Impurity rune 43120 / League Staff 43130 by m27 12700906 (triggers 72700321 / 72700322, personal flags 6676 / 6678) | talk, award | Valtr's quest per player (rule *Covenants per player*); the rune / staff: the guest's own grant (worldact OwnTalkGiftLot, items OfferOwnGift), never a world action; old man gifts as Djura; beggar solid since P3 | ok (0.7.3) | P1, P3 |
 | NPC summons (Henryk, executioner) | 12704400-12704431 | | | minor | none |
 
 ### Byrgenwerth, Lecture Building, Moonside Lake (m32_00)
@@ -311,7 +333,7 @@ major / minor / ok; **fix** = done here (F#), proposal (P#, list at the end) or 
 | Lift to Ebrietas | 12420150-12420156 (State 12420154/155) | | mirrored | minor | |
 | Celestial Emissary | defeat 12421700 (2420), entry 12421702 (no remo); lots 25700000 / 25700005 (ledger 33/34) | | guest fog first | ok | |
 | Ebrietas | defeat 12421800 (2421, 9459), entry 12421802 (no remo); lot 80000300 Great Isz Chalice flag 5009 | | shared | ok | |
-| Queen Annalise revival | 12420500 (removes goods 4305 Queenly Flesh, remo 24020000) | | | minor | |
+| Queen Annalise revival | 12420500 (removes goods 4305 Queenly Flesh, remo 24020000) | | covenant_outcome (0.7.3): per player, with Annalise's state 1040-1059 and 72500300-72500339 | minor | |
 | Insight check | 12425290 (host only, >= 10) | | | ok | |
 | Cosmic Eye Watcher Badge | lots 2420270 / 2420280 (treasure, per player) | | per player | ok | |
 
@@ -324,7 +346,7 @@ major / minor / ok; **fix** = done here (F#), proposal (P#, list at the end) or 
 | Martyr Logarius | defeat 12501800 (2500, 9460), host entry 12501802 remo 25000020 | intro + fight | either goes in first (P5, region visit) | ok | P5 |
 | Unopened Summons | 12500600 lot 2500910 flag 52500910 (award) | | shared | ok | |
 | Queenly Flesh | 12500020, lot 2500920 | | | ok | |
-| Annalise / Yurie / Alfred | 6040 (t250307 -> 9042 lot 17000 Cainhurst Badge), 6150 (t250324) | | solid; gifts as Djura | ok (P1 fixed, live with Eileen) | P1 |
+| Annalise / Yurie / Alfred | 6040 (t250307 -> 9042 lot 17000 Cainhurst Badge), 6150 (t250324) | | solid; gifts as Djura; Annalise 1040-1059 / m25 12500010-12500021, Alfred 1340-1359 / 12400590-12400595 / 12500050-12500054 / 72400460-72400479 / 72500350-72500359 / 9770 are covenant_outcome (0.7.3): Alfred's kill of the queen stays in the world it happened in | ok (P1 fixed, live with Eileen) | P1 |
 | Church marks | 12500206 / 12500220 (world_state toggles) | | | minor | |
 
 ### Nightmare Frontier (m33_00)
@@ -352,7 +374,8 @@ major / minor / ok; **fix** = done here (F#), proposal (P#, list at the end) or 
 | Event | ids | Host | Guest | Risk | Fix |
 |---|---|---|---|---|---|
 | Doll level-up | 12100112-12100118, 72100100-72100113 never_sync (playtest 1) | | per player | ok | |
-| Messenger gifts | Old Hunter Bell 10050 (own grant), Beckoning / Small Resonant Bell 10010 / 10000 | | own grant | ok | |
+| Messenger gifts | Old Hunter Bell 10050 (replayed from the host since 0.7.3, flag 6670 per player; a guest's talk 12101027 goes up and the host's world awards it), Beckoning Bell 10010 (director grant), Notebook 10000 | | C3 / own grant | ok | items.md 10.8 |
+| Starting weapons | messengers 12101020 / 12101021 (never_sync since 0.7.3), stock flags 72101000-72101002 / 72101010-72101011 (per player) | own pick | own pick in its own Dream (a summoned guest cannot pick in the host's Dream) | ok (0.7.3) | items.md 10.8 |
 | Eye of a Blood-drunk Hunter | 12101028 (chr type 0, night 9801, DLC flag), lot 10040 flag 50000100 | gets it | never for a guest | minor | F3 |
 | Badge shops / workshop tools | 12101000 (badges held), 12100450 (tools held) | | own inventory | ok | F2 for the tools |
 | Tear Stone | 12100123 lot 14000 (ledger 0) | | ledger | ok | |
@@ -380,7 +403,7 @@ summoned replay waits for that map or the own world).
 
 | Warp | Event (trigger, gate) | Destination | Who can trigger it | The rest of the party | Status |
 |---|---|---|---|---|---|
-| Snatcher kidnap | 12400780 (m24_00, 4 slots) / 12700500 (m27): local chr type 0, its death by the Snatcher, 9401 + 9404 -> 9420; common 9421 (`End if Client`, until 9423) -> `2003[23] 2802959` | the Gaol cell (m28) on the death's respawn | the host only (a guest is chr type 1) | the host's death is a scripted death warp: the party's respawn load (`host death: a scripted death warp: the Snatcher's kidnap ...`, then `the respawn load for the whole party at lamp 2802959`); every guest wakes beside the host (live: smoke `kidnap`) | fixed (0.7.0 regression) |
+| Snatcher kidnap | 12400780 (m24_00, 4 slots) / 12700500 (m27): local chr type 0, its death by the Snatcher, 9401 + 9404 -> 9420; common 9421 (`End if Client`, until 9423) -> `2003[23] 2802959` | the Gaol cell (m28) on the death's respawn | the host; a guest too since 0.7.3 (its copy past the type gate, the host sets 9420 and moves the party: `party_any_kidnap`) | the host's death is a scripted death warp: the party's respawn load (`host death: a scripted death warp: the Snatcher's kidnap ...`, then `the respawn load for the whole party at lamp 2802959`); every guest wakes beside the host (live: smoke `kidnap`) | fixed (0.7.0 regression) |
 | First death with Insight | common 9404 (`End if Client`): 9401 on, Insight >= 1, the player's death -> `2003[23] 2102961` (12100110 sets 9404 at the Doll's awakening) | the Hunter's Dream (m21) on the death's respawn | the host only | the same rule: the respawn record moved between the host's last frame alive and the funnel to another map (`RespawnMovedAtDeath`), so the party's respawn load; unit-tested, not reached live (no fixture for a first death with Insight) | fixed (unit) |
 | Prologue first death | common 9400 (`End if Client`, ends on 9401 / 12410999) -> `2003[23] 2102962` | the first Dream | the host only | the clinic has no multiplayer (campaign_start.md): never in a party | n/a |
 | DLC entry (the Eye of a Blood-drunk Hunter) | 12405263 (m24_00, Oedon Chapel: Amygdala 2400899 shown at the Blood Moon or 12404001; its grab = event message 710 + goods 4311 held by the local player): remo 24000000 (m24_00), then chr type 0 only: 12401000, `2003[49] 3402959`; arrival 13401000 (no scene, respawn 3402958) | the Hunter's Nightmare (m34) | the host's grab warps; a guest's grab plays the m24 scene only and stays | story warp (P8): "Travel with the party?", YES (default) = the party travel with one load each; the grab scene plays in the map everyone has loaded (live kw: `host_lamp 3402959 as a story warp`, every game in m34_00) | ok |
