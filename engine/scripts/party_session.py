@@ -297,6 +297,14 @@ def undo(user, session=None):
     return session, backup
 
 
+def _had_data(session, folder: Path, p: Path) -> bool:
+    """The session-start copy of `p` held something other than zeros (no session: assume it did)."""
+    if not session:
+        return True
+    before = session.path / "savedata_party" / p.relative_to(folder)
+    return before.is_file() and bool(before.read_bytes().strip(b"\0"))
+
+
 def check(user, session=None) -> list:
     """Problems with the party saves after the session: [(level, text)], level "error" / "warning"."""
     user = Path(user)
@@ -309,7 +317,10 @@ def check(user, session=None) -> list:
         if not p.is_file() or p.name.endswith(".bbtmp"):
             continue
         size = p.stat().st_size
-        if p.name == "userdata0010" and (size != SYSTEM_SIZE or not p.read_bytes().strip(b"\0")):
+        if p.name == "userdata0010" and (size != SYSTEM_SIZE or
+                                         (not p.read_bytes().strip(b"\0") and _had_data(session, folder, p))):
+            # All zeros is only damage when the session started with real data there: a game quit
+            # at the title before its first save leaves the file as it was, zeros (a false alarm).
             problems.append(("error", f"{p.name}: the game data file is damaged ({size} bytes)"))
         elif p.name == "param.bin" and size != PARAM_SIZE:
             problems.append(("error", f"the save description (param.bin) is damaged ({size} bytes)"))
