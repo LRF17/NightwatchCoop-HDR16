@@ -845,6 +845,7 @@ Rules FromSettings() {
     r.any_kidnap = v.party_any_kidnap;
     r.level_sync = v.party_level_sync;
     r.phantom_hp = v.party_phantom_hp;
+    r.pvp_full_hp = v.party_pvp_full_hp;
     r.gather = v.party_gather;
     r.covenant_per_player = v.party_covenant_per_player;
     r.travel_vote = v.party_travel_vote;
@@ -1189,7 +1190,9 @@ void ChrDumpTick(const GameSnapshot& s) {
             char k[48];
             // HP and team too (D11: an NPC hunter's HP on every game during a fight, its team switch
             // 2004[2] mid-fight), at most one dump a second
-            std::snprintf(k, sizeof k, "%d/%d/%d/%d;", entity, hp, off ? 1 : 0, Field<int>(chr, 0x88, -1));
+            // and the height in 4 m steps (0.7.6: a chr falling out of the world, Annalise's chamber)
+            std::snprintf(k, sizeof k, "%d/%d/%d/%d/%d;", entity, hp, off ? 1 : 0, Field<int>(chr, 0x88, -1),
+                          int(std::floor(p[1] / 4.0f)));
             sig += k;
         }
     }
@@ -1630,6 +1633,7 @@ void Tick(const GameSnapshot& s, party::PartyLink* link, bool host) {
     party::status::SetHostRule(party::status::HostRule::AnyKidnap, r.any_kidnap);
     party::status::SetHostRule(party::status::HostRule::LevelSync, r.level_sync);
     party::status::SetHostRule(party::status::HostRule::PhantomHp, r.phantom_hp);
+    party::status::SetHostRule(party::status::HostRule::PvpFullHp, r.pvp_full_hp);
     party::status::SetHostRule(party::status::HostRule::Gather, r.gather);
     party::status::SetHostRule(party::status::HostRule::CovenantPerPlayer, r.covenant_per_player);
     party::status::SetHostRule(party::status::HostRule::TravelVote, r.travel_vote);
