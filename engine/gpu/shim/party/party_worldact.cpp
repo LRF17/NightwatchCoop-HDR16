@@ -3250,9 +3250,43 @@ constexpr float kPrebuildRadius = 150.0f;
 std::atomic<std::uint64_t> g_pre_entry[48];
 std::atomic<bool> g_pre_near[48];
 std::atomic<int> g_pre_n{0};
-void* g_setlevel_orig = nullptr;
 std::atomic<int> g_pre_forced{0};
+// liftwalk077 test aid (BB_TEST_LIFT_BUILD_DELAY=S, BB_TEST_LIFT_BUILD_NEAR=M, default 30): slow resource loading. A full
+// build request (level 2) for a lift car that is not built yet is held back until the local chr has stood within M m of
+// the car for S seconds (whoever asked: the game's cell pass or the prebuild), then passed on. The car then appears S s
+// after a player comes near, as on a slow machine; a walk onto the car right as it builds is the test.
+struct BuildAsk {
+    std::uint64_t entry;
+    double first;  // when the local chr first stood within the near radius with the request pending (0: not yet)
+};
+std::mutex g_bd_mu;
+std::vector<BuildAsk> g_bd;
+double BuildDelaySeconds() {
+    static const double d = [] {
+        const char* e = std::getenv("BB_TEST_LIFT_BUILD_DELAY");
+        return e && *e ? std::atof(e) : 0.0;
+    }();
+    return d;
+}
+bool LiftEntryKnown(std::uint64_t entry);
+void* g_setlevel_orig = nullptr;
+// true: pass the request now; false: held (the tick passes it later)
+bool BuildGate(std::uint64_t entry, std::int32_t level) {
+    if (level != 2 || BuildDelaySeconds() <= 0.0 || !LiftEntryKnown(entry)) return true;
+    std::uint64_t ctrl = 1;
+    if (SafeGet(entry + 0x290, &ctrl) && ctrl) return true;  // built already
+    std::lock_guard<std::mutex> lk(g_bd_mu);
+    for (const BuildAsk& b : g_bd) {
+        if (b.entry == entry) return false;
+    }
+    g_bd.push_back({entry, 0.0});
+    Log("lift car build delay (test aid): car entry %#llx full build held until the local chr has been near it for %.1f s",
+        static_cast<unsigned long long>(entry), BuildDelaySeconds());
+    return false;
+}
+
 BB_COOP_SYSV std::uint64_t SetLevelHook(std::uint64_t entry, std::int32_t level) {
+    if (!BuildGate(entry, level)) return 0;
     if (level != 2) {
         const int n = g_pre_n.load(std::memory_order_relaxed);
         for (int i = 0; i < n; ++i) {
@@ -3270,7 +3304,75 @@ BB_COOP_SYSV std::uint64_t SetLevelHook(std::uint64_t entry, std::int32_t level)
     }
     return reinterpret_cast<std::uint64_t(BB_COOP_SYSV*)(std::uint64_t, std::int32_t)>(g_setlevel_orig)(entry, level);
 }
+bool LiftEntryKnown(std::uint64_t entry) {
+    const int n = g_pre_n.load(std::memory_order_relaxed);
+    for (int i = 0; i < n; ++i) {
+        if (g_pre_entry[i].load(std::memory_order_relaxed) == entry) return true;
+    }
+    return false;
+}
+// the held requests of BuildGate: passed on once the local chr has been near the car long enough
+void LiftBuildDelayTick(const GameSnapshot& s) {
+    // BB_TEST_LIFT_BUILD_DROP=M: a built car whose chr is more than M m away and which is not playing is dropped
+    // (level 3, as the game does for a far cell), so the next approach meets an unbuilt car again.
+    static const double drop_m = [] {
+        const char* e = std::getenv("BB_TEST_LIFT_BUILD_DROP");
+        return e && *e ? std::atof(e) : 0.0;
+    }();
+    if (BuildDelaySeconds() <= 0.0 && drop_m <= 0.0) return;
+    std::lock_guard<std::mutex> lk(g_bd_mu);
+    if (!s.world_up || s.loading) {
+        g_bd.clear();
+        return;
+    }
+    if (drop_m > 0.0 && s.player) {
+        float me2[4], rot2[4];
+        if (LocalChrPose(me2, rot2)) {
+            for (const Lift& l : Lifts()) {
+                ObjAnimState a;
+                float at[3];
+                std::uint64_t ctrl = 0;
+                if (l.car && g_setlevel_orig && ReadObjAnim(l.car, &a) && a.entry && !a.playing && SafeGet(a.entry + 0x290, &ctrl) && ctrl &&
+                    ObjectPoint(l.car, 0, 0, at) && std::hypot(me2[0] - at[0], me2[2] - at[2]) > drop_m) {
+                    Log("lift car build drop (test aid): car %d entry %#llx dropped (local chr %.0f m away)", l.car,
+                        static_cast<unsigned long long>(a.entry), double(std::hypot(me2[0] - at[0], me2[2] - at[2])));
+                    reinterpret_cast<std::uint64_t(BB_COOP_SYSV*)(std::uint64_t, std::int32_t)>(g_setlevel_orig)(a.entry, 3);
+                }
+            }
+        }
+    }
+    if (BuildDelaySeconds() <= 0.0) return;
+    static const double near_m = [] {
+        const char* e = std::getenv("BB_TEST_LIFT_BUILD_NEAR");
+        return e && *e ? std::atof(e) : 30.0;
+    }();
+    float me[4], rot[4];
+    if (!s.player || !LocalChrPose(me, rot)) return;
+    for (std::size_t i = 0; i < g_bd.size();) {
+        BuildAsk& b = g_bd[i];
+        bool near = false;
+        for (const Lift& l : Lifts()) {
+            ObjAnimState a;
+            float at[3];
+            if (l.car && ReadObjAnim(l.car, &a) && a.entry == b.entry && ObjectPoint(l.car, 0, 0, at) &&
+                std::hypot(me[0] - at[0], me[2] - at[2]) < near_m) {
+                near = true;
+            }
+        }
+        if (near && b.first == 0.0) b.first = Now();
+        if (!near) b.first = 0.0;
+        if (b.first != 0.0 && Now() - b.first >= BuildDelaySeconds()) {
+            Log("lift car build delay (test aid): car entry %#llx full build passed on after %.1f s near", static_cast<unsigned long long>(b.entry),
+                Now() - b.first);
+            reinterpret_cast<std::uint64_t(BB_COOP_SYSV*)(std::uint64_t, std::int32_t)>(g_setlevel_orig)(b.entry, 2);
+            g_bd.erase(g_bd.begin() + static_cast<std::ptrdiff_t>(i));
+        } else {
+            ++i;
+        }
+    }
+}
 void LiftPrebuildTick(const GameSnapshot& s) {
+    LiftBuildDelayTick(s);
     static const bool off = [] {
         const char* e = std::getenv("BB_PARTY_LIFT_PREBUILD");
         return e && e[0] == '0';
@@ -3296,7 +3398,7 @@ void LiftPrebuildTick(const GameSnapshot& s) {
             static double last_ask[48];
             if (near && g_setlevel_orig && SafeGet(a.entry + 0x1f9, &rq) && rq != 4 && Now() - last_ask[n - 1] > 1.0) {
                 last_ask[n - 1] = Now();
-                reinterpret_cast<std::uint64_t(BB_COOP_SYSV*)(std::uint64_t, std::int32_t)>(g_setlevel_orig)(a.entry, 2);
+                if (BuildGate(a.entry, 2)) reinterpret_cast<std::uint64_t(BB_COOP_SYSV*)(std::uint64_t, std::int32_t)>(g_setlevel_orig)(a.entry, 2);
                 static int logged = 0;
                 if (logged++ < 8) {
                     Log("lift car prebuild: car %d (entry %#llx) was at level %u: asked to build fully (local chr %.0f m away)", e,
@@ -3314,9 +3416,14 @@ void LiftPrebuildTick(const GameSnapshot& s) {
 // arrival: the guest dropped 25 m through the unbuilt car and died). While the local chr is near such a car and
 // starts to fall, it is put back on the last spot it stood on and held there until the car is built (or 10 s).
 void LiftBuildGuardTick(const GameSnapshot& s) {
+    struct Sample {
+        double t;
+        float p[3], rot[4];
+    };
     static struct {
-        bool have = false, pinned = false;
-        float good[3] = {}, rot[4] = {}, last_y = 0;
+        bool pinned = false;
+        std::deque<Sample> hist;  // where the chr stood in the last 2.5 s (not falling)
+        float good[3] = {}, rot[4] = {}, last[3] = {};
         double t = 0, pin_since = 0, grace = 0;
     } g;
     static const bool off = [] {
@@ -3324,46 +3431,69 @@ void LiftBuildGuardTick(const GameSnapshot& s) {
         return e && e[0] == '0';
     }();
     if (off || !s.world_up || s.loading || !s.player) {
-        g.have = g.pinned = false;
+        g.hist.clear();
+        g.pinned = false;
         return;
     }
     float me[4], rot[4];
     if (!LocalChrPose(me, rot)) return;
+    // liftwalk077: the spot the chr stood on is tracked on every tick, not only once an unbuilt car is near, and the
+    // hold puts the chr back on ground it stood on 0.8 s before its fall began: a car that was never asked for (level
+    // dropped, not active) left the guard idle until it turned active, 1-2 s after the chr had stepped into the empty
+    // shaft, the spot recorded then was 15 m down and the hold kept the chr falling in place (live lfws6: y -209); a spot
+    // recorded at the first sign of a fall is already over the hole, a hold there keeps the fall speed growing and the
+    // chr falls through the car's floor at the release (lfws7). Standing on the landing resets the fall speed.
+    // "Not built" is no animation controller (entry +0x290) or, for the car itself, no hit object (+0x288, the floor).
     bool unbuilt_near = false;
     for (const Lift& l : Lifts()) {
         for (const std::int32_t e : {l.car, l.gate_rides ? l.gate : 0}) {
             ObjAnimState a;
             float at[3];
-            std::uint64_t ctrl = 1;
-            if (!e || !ReadObjAnim(e, &a) || !a.entry || !(a.flags & 0x40) || !SafeGet(a.entry + 0x290, &ctrl) || ctrl ||
-                !ObjectPoint(e, 0, 0, at)) {
-                continue;
-            }
-            if (std::hypot(me[0] - at[0], me[2] - at[2]) < kLiftCarRadius + 2.0f) unbuilt_near = true;
+            std::uint64_t ctrl = 1, hit = 1;
+            if (!e || !ReadObjAnim(e, &a) || !a.entry || !SafeGet(a.entry + 0x290, &ctrl) || !ObjectPoint(e, 0, 0, at)) continue;
+            if (e == l.car && !SafeGet(a.entry + 0x288, &hit)) hit = 1;
+            if ((ctrl && hit) || std::hypot(me[0] - at[0], me[2] - at[2]) >= kLiftCarRadius + 2.0f) continue;
+            unbuilt_near = true;
         }
     }
     const double now = Now();
     if (unbuilt_near) g.grace = now + 2.5;  // the car's floor enters the world a moment after the build
+    const double dt = now - g.t;
+    float vy = 0.0f;
+    if (!g.hist.empty() && dt > 0.0 && dt < 1.0) {
+        const float dx = me[0] - g.last[0], dz = me[2] - g.last[2], dy = me[1] - g.last[1];
+        if (!g.pinned && (std::hypot(dx, dz) > 2.0f || std::fabs(dy) > 4.0f)) {
+            g.hist.clear();  // a warp / respawn, not a fall
+        } else {
+            vy = dy / float(dt);
+        }
+    }
+    g.t = now;
+    std::memcpy(g.last, me, sizeof g.last);
+    if (!g.pinned && (g.hist.empty() || vy > -1.5f)) {
+        Sample sm{now, {me[0], me[1], me[2]}, {rot[0], rot[1], rot[2], rot[3]}};
+        g.hist.push_back(sm);
+        while (g.hist.size() > 1 && now - g.hist.front().t > 2.5) g.hist.pop_front();
+    }
     if (!unbuilt_near && now > g.grace) {
-        g.have = g.pinned = false;
+        g.pinned = false;
         return;
     }
-    const double dt = now - g.t;
-    const float vy = g.have && dt > 0.0 ? float((me[1] - g.last_y) / dt) : 0.0f;
-    g.t = now, g.last_y = me[1];
     if (g.pinned && !unbuilt_near) g.pinned = false;  // built: no more holding, a fall is still put back
     if (g.pinned && now - g.pin_since > 10.0) {
         g.pinned = false;
         Log("lift car floor: the car near the local chr was not built in 10 s; released");
         return;
     }
-    if (!g.pinned && (!g.have || vy > -3.0f)) {
-        g.have = true;
-        std::memcpy(g.good, me, sizeof g.good);
-        std::memcpy(g.rot, rot, sizeof g.rot);
-        return;
-    }
+    if (!g.pinned && vy > -3.0f) return;
     if (!g.pinned) {
+        const Sample* pick = g.hist.empty() ? nullptr : &g.hist.front();
+        for (const Sample& sm : g.hist) {
+            if (now - sm.t >= 0.8) pick = &sm;  // the newest sample at least 0.8 s old
+        }
+        if (!pick) return;
+        std::memcpy(g.good, pick->p, sizeof g.good);
+        std::memcpy(g.rot, pick->rot, sizeof g.rot);
         g.pinned = unbuilt_near;
         g.pin_since = now;
         Log("lift car floor: the local chr falls (%.1f m/s) at (%.1f, %.1f, %.1f) next to a lift car that is not built yet: held at "
