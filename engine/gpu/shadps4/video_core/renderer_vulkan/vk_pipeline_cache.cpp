@@ -395,9 +395,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes} {
+    // Native+ was HDR16: the two messages below keep that name, as their text is part of
+    // gpu-cache.id (build.sh) and changing it would start every player's shader cache again.
     ASSERT_MSG(!HdrChannel::Native16() ||
         instance.GetPhysicalDevice().getProperties().limits.maxPushConstantsSize >= 176,
-        "Native+ requires 176 bytes of Vulkan push constants; choose Native or Expand on this GPU");
+        "HDR16 requires 176 bytes of Vulkan push constants; choose Native or Expand on this GPU");
     sel.regs = &liverpool->regs;
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
@@ -493,7 +495,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // (bb_composite_hdr.frag, BB_CB_UBO); with another layout, the legacy compiler.
     if (HdrChannel::Native16() && profile.uniform_constant_buffers &&
         (!profile.uniform_dword_layout || profile.uniform_exact_base)) {
-        std::printf("Native shaders: off in HDR mode Native+ (BB_UBO_DWORDS=0, BB_UBO_EXACT=1 or no "
+        std::printf("Native shaders: off in HDR mode HDR16 (BB_UBO_DWORDS=0, BB_UBO_EXACT=1 or no "
                     "uniform buffer standard layout: its composite reads dwords at the push "
                     "data's offset)\n");
         profile.uniform_constant_buffers = false;
